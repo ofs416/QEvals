@@ -156,4 +156,4 @@ Beyond the `run.py` pipeline and its `tests/`, the repo carries auxiliary and hi
 | `sympy_render.py` / `test_sympy_render.py` | Host-side LaTeX rendering from SymPy *segment programs* (the sympy refiner arm) + its unit tests |
 | `q_solver.py` / `full_questions.py` | Standalone SymPy scripts that compute/verify question answers |
 
-**`gem_evals/`** — separate exam-generation-and-rendering subproject (its own `AGENTS.md`). `drafter.py` → `reviewer.py` → `optimiser.py` → `typesetter.py` chained by `run_exam_pipeline.py`; `render.py` / `render_exam.py` produce a PDF; `exam_pipeline_skill/SKILL.md` packages it as a skill. Prompt sets live in `prompts.txt` / `prompts_backwards.txt`.
+**`gem_evals/`** — prompt sets from an earlier exam-generation experiment: `prompts.txt` and `prompts_backwards.txt` (the work-backwards variant).
