@@ -1,15 +1,18 @@
-# evals/CLAUDE.md
+# QEvals/CLAUDE.md
 
-LLM evaluation pipeline for comparing question-generation models. See the root [`CLAUDE.md`](../CLAUDE.md) for project-wide context.
+LLM evaluation pipeline for comparing question-generation models. This is the root of the `QEvals` repo.
 
 ## Purpose
 
 Benchmarks candidate LLMs on their ability to generate well-formed AQA/Edexcel A-level Maths questions. Outputs a scored HTML/Markdown report used to decide which model(s) to use in the Pergrad production pipeline.
 
+The current system is the `run.py` **litellm pipeline** documented below. The repo also carries earlier `google-genai` prototypes and a separate exam-rendering subproject — see **Repository Layout** at the end.
+
 ## Running
 
+Run from the repo root:
+
 ```
-cd evals
 python run.py                          # full pipeline (all models, all topics)
 python run.py --models gemini-flash,gpt-nano   # subset of models
 python run.py --skip-generate          # load existing generations, re-solve + re-judge
@@ -18,7 +21,7 @@ python run.py --run-id my-run-id       # use a fixed run ID instead of a timesta
 python run.py --models gpt55 --compare-prompts baseline,no_guards  # A/B two generator prompts on one model
 ```
 
-Requires API keys in `evals/.env`: `OPENROUTER_API_KEY` for OpenRouter-routed models, and `GEMINI_API_KEY` for the direct-Gemini models (see **Routing** below). `litellm` dispatches each call on its model-id prefix.
+Requires API keys in `.env` (gitignored): `OPENROUTER_API_KEY` for OpenRouter-routed models, and `GEMINI_API_KEY` for the direct-Gemini models (see **Routing** below). `litellm` dispatches each call on its model-id prefix.
 
 **Prompt A/B (`--compare-prompts`):** holds one generator model fixed (`--models` must resolve to exactly one) and runs every named variant from `prompts.PROMPT_VARIANTS` across all topics/boards. Generations are tagged with `prompt_variant`, and the report groups by variant instead of model — the summary table, topic matrix, and viewer tabs show one entry per prompt. Add a variant by writing a `(strand, board) -> str` builder and registering it in `PROMPT_VARIANTS` (baseline = the current `specialist_system_prompt`; `no_guards` drops the strand design guards as a worked example).
 
@@ -127,4 +130,30 @@ Defined in `config.py`. IDs are either OpenRouter paths (`openrouter/<provider>/
 
 ## Results
 
-`evals/results/` — gitignored. Each run produces 5 files, one per output type, foldered by kind: `generations/<run_id>.jsonl`, `solutions/<run_id>.jsonl`, `judgements/<run_id>.jsonl`, `markdown/<run_id>.md`, `html/<run_id>.html`. Open the HTML report in a browser; the Markdown table is useful for quick comparison in a terminal or PR diff.
+`results/` — gitignored. Each run produces 5 files, one per output type, foldered by kind: `generations/<run_id>.jsonl`, `solutions/<run_id>.jsonl`, `judgements/<run_id>.jsonl`, `markdown/<run_id>.md`, `html/<run_id>.html`. Open the HTML report in a browser; the Markdown table is useful for quick comparison in a terminal or PR diff.
+
+## Repository Layout
+
+Beyond the `run.py` pipeline and its `tests/`, the repo carries auxiliary and historical code. None of it is imported by the main pipeline.
+
+**Probe scripts** (one-off feasibility checks, not part of the pipeline):
+
+| File | Role |
+|------|------|
+| `_probe_reasoning.py` | Reasoning-model behaviour probe |
+| `_probe_grok.py` | Tests whether `x-ai/grok-4.3` works as a solver on known-bad mark schemes |
+| `_probe_native.py` | Feasibility / hard-gate probe for the Gemini native code-exec arm |
+
+**Earlier `google-genai` prototypes** (direct Gemini SDK, predate the litellm harness; built around a "work-backwards protocol" where the model picks clean answers first, then reverse-engineers the givens and verifies with code execution). Each `*_test.py` is a self-contained run harness with a matching cost calculator; outputs (`*_results.json`, `*_evaluation_report.json`) are gitignored:
+
+| File | Role |
+|------|------|
+| `test_math_prompts.py` | Standalone prompt experiment against `GEMINI_API_KEY` |
+| `pipeline_test.py` | Multi-stage generate→evaluate prototype |
+| `hybrid_test.py` / `hybrid_cost_calc.py` | Hybrid-approach harness + cost calc |
+| `cost_calc.py` | Token/cost calculator for the prototype prompts |
+| `draft_refine_sympy.py` / `draft_refine_test.py` | Draft→Refine A/B: model-authored LaTeX vs host-rendered SymPy (one drafter, two refiner arms) |
+| `sympy_render.py` / `test_sympy_render.py` | Host-side LaTeX rendering from SymPy *segment programs* (the sympy refiner arm) + its unit tests |
+| `q_solver.py` / `full_questions.py` | Standalone SymPy scripts that compute/verify question answers |
+
+**`gem_evals/`** — separate exam-generation-and-rendering subproject (its own `AGENTS.md`). `drafter.py` → `reviewer.py` → `optimiser.py` → `typesetter.py` chained by `run_exam_pipeline.py`; `render.py` / `render_exam.py` produce a PDF; `exam_pipeline_skill/SKILL.md` packages it as a skill. Prompt sets live in `prompts.txt` / `prompts_backwards.txt`.
