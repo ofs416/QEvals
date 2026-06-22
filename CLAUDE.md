@@ -101,7 +101,6 @@ The HTML viewer groups questions under their topic batch (header shows an "X/N p
 | `judge.py` | Stage 3 async judging loop |
 | `report.py` | Stage 4 report generation (Markdown + HTML) |
 | `run.py` | CLI entrypoint — orchestrates all stages |
-| `_probe_reasoning.py` | One-off probe script for testing reasoning model behaviour (not part of the main pipeline) |
 
 ## Routing (OpenRouter vs direct Gemini)
 
@@ -134,26 +133,6 @@ Defined in `config.py`. IDs are either OpenRouter paths (`openrouter/<provider>/
 
 ## Repository Layout
 
-Beyond the `run.py` pipeline and its `tests/`, the repo carries auxiliary and historical code. None of it is imported by the main pipeline.
-
-**Probe scripts** (one-off feasibility checks, not part of the pipeline):
-
-| File | Role |
-|------|------|
-| `_probe_reasoning.py` | Reasoning-model behaviour probe |
-| `_probe_grok.py` | Tests whether `x-ai/grok-4.3` works as a solver on known-bad mark schemes |
-| `_probe_native.py` | Feasibility / hard-gate probe for the Gemini native code-exec arm |
-
-**Earlier `google-genai` prototypes** (direct Gemini SDK, predate the litellm harness; built around a "work-backwards protocol" where the model picks clean answers first, then reverse-engineers the givens and verifies with code execution). Each `*_test.py` is a self-contained run harness with a matching cost calculator; outputs (`*_results.json`, `*_evaluation_report.json`) are gitignored:
-
-| File | Role |
-|------|------|
-| `test_math_prompts.py` | Standalone prompt experiment against `GEMINI_API_KEY` |
-| `pipeline_test.py` | Multi-stage generate→evaluate prototype |
-| `hybrid_test.py` / `hybrid_cost_calc.py` | Hybrid-approach harness + cost calc |
-| `cost_calc.py` | Token/cost calculator for the prototype prompts |
-| `draft_refine_sympy.py` / `draft_refine_test.py` | Draft→Refine A/B: model-authored LaTeX vs host-rendered SymPy (one drafter, two refiner arms) |
-| `sympy_render.py` / `test_sympy_render.py` | Host-side LaTeX rendering from SymPy *segment programs* (the sympy refiner arm) + its unit tests |
-| `q_solver.py` / `full_questions.py` | Standalone SymPy scripts that compute/verify question answers |
+Beyond the `run.py` pipeline and its `tests/`, the repo carries one auxiliary directory. It is not imported by the main pipeline.
 
 **`gem_evals/`** — prompt sets from an earlier exam-generation experiment: `prompts.txt` and `prompts_backwards.txt` (the work-backwards variant).
