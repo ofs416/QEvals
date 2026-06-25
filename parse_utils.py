@@ -72,6 +72,16 @@ def valid_generation(parsed: object) -> bool:
     )
 
 
+def valid_drafts(parsed: object) -> bool:
+    """True if parsed drafter output has a non-empty 'drafts' list of strings."""
+    return (
+        isinstance(parsed, dict)
+        and isinstance(parsed.get("drafts"), list)
+        and len(parsed["drafts"]) > 0
+        and all(isinstance(d, str) for d in parsed["drafts"])
+    )
+
+
 def parse_json_robust(text: str | None) -> tuple[dict | None, str | None]:
     """Extract and parse the first JSON object from text.
 

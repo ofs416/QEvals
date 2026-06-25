@@ -3,11 +3,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from config import (
+    MATHS_JUDGE_MODEL,
     MODELS,
+    OPTIMISER_MODEL,
     STRANDS,
     TOPICS,
     USAGE_INCLUDE,
-    model_by_short,
     request_kwargs,
     response_cost,
     route_of,
@@ -127,8 +128,13 @@ def test_response_cost_direct_route_returns_zero_when_pricing_unknown(capsys):
     assert "completion_cost" in capsys.readouterr().out
 
 
-def test_gemini_lite_native_entry_is_native_and_gemini_routed():
-    m = model_by_short("gemini-lite-native")
-    assert m["native_code_exec"] is True
-    assert m["id"] == "gemini/gemini-3.1-flash-lite"
-    assert route_of(m) == "gemini"
+def test_generators_all_route_through_openrouter():
+    """The ranked candidates must all be OpenRouter so they compare fairly."""
+    for m in MODELS:
+        assert route_of(m) == "openrouter"
+
+
+def test_optimiser_and_maths_judge_use_native_gemini_sandbox():
+    for m in (OPTIMISER_MODEL, MATHS_JUDGE_MODEL):
+        assert m["native_code_exec"] is True
+        assert route_of(m) == "gemini"

@@ -1,139 +1,149 @@
-import asyncio, json, time
-from collections import defaultdict
+"""Stage 4: the judge panel — two gates, both must pass.
+
+Each finalised question is checked by two independent judges:
+  * MATHS_JUDGE_MODEL (Gemini, server-side sandbox) — re-derives the maths and
+    returns a hard maths_correct verdict.
+  * STYLE_JUDGE_MODEL (Opus) — scores command word, difficulty and style.
+
+A question passes only if it is maths_correct AND its suitability total meets
+SUITABILITY_THRESHOLD. A judge call that fails to parse fails its gate (the
+conservative direction — an unverified question does not pass).
+"""
+import asyncio
+import time
 from datetime import datetime, timezone
-from config import JUDGE_MODEL, JUDGE_REASONING, PASS_THRESHOLD, SOLVER_MODELS, request_kwargs, response_cost
+
+from config import (
+    JUDGE_REASONING,
+    MATHS_JUDGE_MODEL,
+    STYLE_JUDGE_MODEL,
+    SUITABILITY_THRESHOLD,
+    request_kwargs,
+    response_cost,
+)
 from llm_utils import acompletion_with_retry
-from prompts import judge_prompt
 from parse_utils import parse_json_robust
-
-# Minimum number of independent solvers reconciling the same question as
-# scheme_wrong before the hard fail-rule fires.
-SCHEME_WRONG_CONSENSUS_MIN = 2
+from prompts import maths_judge_prompt, style_judge_prompt
 
 
-def group_solutions_by_generation(solutions: list[dict]) -> dict[str, list[dict]]:
-    grouped = defaultdict(list)
-    for sol in solutions:
-        grouped[sol["generation_id"]].append(sol)
-    return dict(grouped)
-
-
-def apply_scheme_wrong_consensus(judgement: dict, solutions: list[dict]) -> dict:
-    """Hard rule, not judge discretion: when >= SCHEME_WRONG_CONSENSUS_MIN
-    solvers independently reconcile the SAME question as scheme_wrong, that
-    question must not pass — cap its correctness at 2, its total below the pass
-    threshold, and flag it. Other questions in the batch are unaffected.
+async def _judge_call(model: dict, prompt: str, *, sandbox: bool) -> dict:
+    """One judge call. Returns parsed per-question entries keyed by index plus
+    token/cost/parse_ok. A non-parsing response yields an empty map (gate fails).
     """
-    by_question: dict = defaultdict(set)
-    for sol in solutions:
-        for rec in sol.get("reconciliation") or []:
-            if rec.get("verdict") == "scheme_wrong" and "question_index" in rec:
-                by_question[rec["question_index"]].add(sol.get("solver_short"))
-    consensus = {
-        qi for qi, solvers in by_question.items()
-        if len(solvers) >= SCHEME_WRONG_CONSENSUS_MIN
+    kwargs = dict(
+        model=model["id"],
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=32768 if sandbox else 16384,
+        timeout=300 if sandbox else 60,
+        retry_on_blank=True,
+        **request_kwargs(model, JUDGE_REASONING),
+    )
+    if sandbox:
+        kwargs["tools"] = [{"code_execution": {}}]
+    response = await acompletion_with_retry(**kwargs)
+
+    usage = getattr(response, "usage", None)
+    msg = response.choices[0].message
+    content = msg.content or getattr(msg, "reasoning_content", None) or ""
+    parsed, err = parse_json_robust(content)
+    by_index = {}
+    if parsed is not None:
+        for q in parsed.get("questions") or []:
+            if isinstance(q, dict) and "question_index" in q:
+                by_index[q["question_index"]] = q
+    return {
+        "by_index": by_index,
+        "parse_ok": parsed is not None,
+        "input_tokens": (usage.prompt_tokens or 0) if usage else 0,
+        "output_tokens": (usage.completion_tokens or 0) if usage else 0,
+        "cost": response_cost(model, response),
     }
-    if not consensus:
-        return judgement
-
-    new_questions = []
-    for q in judgement.get("questions") or []:
-        if q.get("question_index") in consensus:
-            scores = dict(q.get("scores") or {})
-            correctness = scores.get("correctness")
-            if isinstance(correctness, (int, float)) and correctness > 2:
-                scores["correctness"] = 2
-            total = sum(v for v in scores.values() if isinstance(v, (int, float)))
-            flags = list(q.get("flags") or [])
-            if "scheme_wrong_consensus" not in flags:
-                flags.append("scheme_wrong_consensus")
-            q = {**q, "scores": scores, "total": min(total, PASS_THRESHOLD - 1), "flags": flags}
-        new_questions.append(q)
-    return {**judgement, "questions": new_questions}
 
 
-async def judge_one(generation: dict, solutions: list[dict]) -> dict:
-    base = {
-        "generation_id": generation["generation_id"],
-        "judge_model": JUDGE_MODEL["id"],
+def _base(generation_id: str) -> dict:
+    return {
+        "generation_id": generation_id,
+        "maths_judge_model": MATHS_JUDGE_MODEL["id"],
+        "style_judge_model": STYLE_JUDGE_MODEL["id"],
         "questions": [],
         "flags": [],
-        "solver_agreement": {f"{s['short']}_agrees": None for s in SOLVER_MODELS},
-        "judge_input_tokens": 0,
-        "judge_output_tokens": 0,
-        "judge_cost_usd": 0.0,
+        "maths_judge_input_tokens": 0,
+        "maths_judge_output_tokens": 0,
+        "maths_judge_cost_usd": 0.0,
+        "style_judge_input_tokens": 0,
+        "style_judge_output_tokens": 0,
+        "style_judge_cost_usd": 0.0,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
-    if not generation["json_parse_ok"]:
-        base["flags"].append("json_parse_failure")
+
+async def judge_one(optimisation: dict) -> dict:
+    base = _base(optimisation["generation_id"])
+    questions = optimisation.get("questions") or []
+    if optimisation.get("skipped") or not optimisation.get("parse_ok") or not questions:
+        base["flags"].append("optimiser_failure")
         return base
 
+    board = optimisation.get("board") or "Edexcel"
     start = time.time()
-    response = await acompletion_with_retry(
-        model=JUDGE_MODEL["id"],
-        messages=[{"role": "user", "content": judge_prompt(generation, solutions)}],
-        max_tokens=16384,
-        timeout=60,
-        **request_kwargs(JUDGE_MODEL, JUDGE_REASONING),
-        retry_on_blank=True,
+    maths, style = await asyncio.gather(
+        _judge_call(MATHS_JUDGE_MODEL, maths_judge_prompt(questions, board), sandbox=True),
+        _judge_call(STYLE_JUDGE_MODEL, style_judge_prompt(questions, board), sandbox=False),
     )
     latency_ms = int((time.time() - start) * 1000)
 
-    if response.choices[0].finish_reason == "length":
-        print(f"[judge] output truncated at max_tokens for {generation['generation_id']}")
-    content = response.choices[0].message.content or ""
-    input_tokens = response.usage.prompt_tokens or 0
-    output_tokens = response.usage.completion_tokens or 0
+    flags = []
+    if not maths["parse_ok"]:
+        flags.append("maths_judge_parse_failure")
+    if not style["parse_ok"]:
+        flags.append("style_judge_parse_failure")
 
-    parsed, err = parse_json_robust(content)
-    if err:
-        print(f"[judge] JSON parse error for {generation['generation_id']}: {err}")
+    merged = []
+    for i in range(len(questions)):
+        m = maths["by_index"].get(i, {})
+        s = style["by_index"].get(i, {})
+        scores = s.get("scores") if isinstance(s.get("scores"), dict) else {}
+        suitability_total = s.get("suitability_total")
+        if not isinstance(suitability_total, (int, float)):
+            suitability_total = sum(v for v in scores.values() if isinstance(v, (int, float)))
+        maths_correct = m.get("maths_correct") is True
+        merged.append({
+            "question_index": i,
+            "maths_correct": maths_correct,
+            "maths_note": m.get("note", ""),
+            "scores": scores,
+            "suitability_total": suitability_total,
+            "passed": maths_correct and suitability_total >= SUITABILITY_THRESHOLD,
+            "flags": s.get("flags") or [],
+            "notes": s.get("notes") or {},
+        })
 
-    base["judge_input_tokens"] = input_tokens
-    base["judge_output_tokens"] = output_tokens
-    base["judge_cost_usd"] = response_cost(JUDGE_MODEL, response)
-
-    if parsed is None:
-        base["flags"].append("judge_parse_failure")
-        return base
-
-    questions = parsed.get("questions") or []
-    for q in questions:
-        scores = q.get("scores")
-        if "total" not in q and isinstance(scores, dict):
-            q["total"] = sum(v for v in scores.values() if isinstance(v, (int, float)))
-
-    judgement = {
+    return {
         **base,
-        "questions": questions,
-        "solver_agreement": parsed.get("solver_agreement", base["solver_agreement"]),
+        "questions": merged,
+        "flags": flags,
+        "maths_judge_input_tokens": maths["input_tokens"],
+        "maths_judge_output_tokens": maths["output_tokens"],
+        "maths_judge_cost_usd": maths["cost"],
+        "style_judge_input_tokens": style["input_tokens"],
+        "style_judge_output_tokens": style["output_tokens"],
+        "style_judge_cost_usd": style["cost"],
         "latency_ms": latency_ms,
     }
-    return apply_scheme_wrong_consensus(judgement, solutions)
 
 
-async def judge_all(generations: list[dict], solutions: list[dict]) -> list[dict]:
+async def judge_all(optimisations: list[dict]) -> list[dict]:
     semaphore = asyncio.Semaphore(10)
-    grouped = group_solutions_by_generation(solutions)
 
-    async def _with_sem(gen):
+    async def _with_sem(opt):
         async with semaphore:
             try:
-                return await judge_one(gen, grouped.get(gen["generation_id"], []))
+                return await judge_one(opt)
             except Exception as e:
-                print(f"[judge] {type(e).__name__} for {gen['generation_id']}: {e}")
-                return {
-                    "generation_id": gen["generation_id"],
-                    "judge_model": JUDGE_MODEL["id"],
-                    "questions": [],
-                    "flags": ["api_error"],
-                    "solver_agreement": {f"{s['short']}_agrees": None for s in SOLVER_MODELS},
-                    "judge_input_tokens": 0,
-                    "judge_output_tokens": 0,
-                    "judge_cost_usd": 0.0,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "error": str(e)[:200],
-                }
+                print(f"[judge] {type(e).__name__} for {opt['generation_id']}: {e}")
+                rec = _base(opt["generation_id"])
+                rec["flags"].append("api_error")
+                rec["error"] = str(e)[:200]
+                return rec
 
-    return await asyncio.gather(*[_with_sem(g) for g in generations])
+    return await asyncio.gather(*[_with_sem(o) for o in optimisations])

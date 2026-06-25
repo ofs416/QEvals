@@ -1,143 +1,75 @@
 import os
-import shlex
 
 import litellm
 
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "results")
 
-# A generator may carry its own "reasoning" override; absent that, the global
-# GENERATOR_REASONING default applies. "reasoning": None opts a model out
-# entirely (for non-reasoning models whose endpoints reject the param).
+# The ranked generator candidates — the DRAFTER stage. Each drafts question
+# scenarios only (no mark scheme, rough numbers); the maths optimiser owns the
+# arithmetic, so a generator no longer runs code and carries no native_code_exec.
+# All go through OpenRouter so their performance can be compared head-to-head.
+# A model may carry its own "reasoning" override; absent that, GENERATOR_REASONING
+# applies ("reasoning": None opts a model out of the param entirely).
 MODELS = [
-    {"id": "openrouter/openai/gpt-5.4-nano", "short": "gpt-nano"},
-    # Gemini goes direct to Google AI Studio (needs GEMINI_API_KEY) — the chosen
-    # production provider. Going direct also makes the old OpenRouter
-    # google-ai-studio provider pin (added because the default route returned
-    # blank finish_reason 'error' responses under load) obsolete: we ARE
-    # google-ai-studio now. Cost is computed from litellm's price table.
-    {"id": "gemini/gemini-2.5-flash", "short": "gemini-flash"},
-    {"id": "gemini/gemini-3.1-flash-lite", "short": "gemini-lite"},
-    # Experiment arm (2026-06): identical model, but uses Gemini's server-side
-    # code_execution sandbox instead of the harness-local run_python loop.
-    # A/B against gemini-lite for the native-code-exec quality/price experiment
-    # (docs/superpowers/specs/2026-06-16-gemini-native-codeexec-experiment-design.md).
-    {
-        "id": "gemini/gemini-3.1-flash-lite",
-        "short": "gemini-lite-native",
-        "native_code_exec": True,
-    },
-    {"id": "openrouter/mistralai/mistral-small-2603", "short": "mistral-small4"},
-    {"id": "openrouter/qwen/qwen3.6-flash", "short": "qwen-flash"},
+    {"id": "openrouter/openai/gpt-5.5", "short": "gpt55"},
+    {"id": "openrouter/x-ai/grok-4.3", "short": "grok43"},
     {"id": "openrouter/qwen/qwen3.7-plus", "short": "qwen-plus"},
-    {"id": "openrouter/deepseek/deepseek-v4-flash", "short": "deepseek"},
-    {"id": "openrouter/z-ai/glm-4.7-flash", "short": "GLMflash"},
-    {"id": "openrouter/xiaomi/mimo-v2.5", "short": "mimo"},
-    # kimi thinks by default and inverts the effort knob (probe: effort=low
-    # produced MORE reasoning tokens than default, and a reasoning max_tokens
-    # budget is only loosely respected). {"enabled": False} is the only control
-    # that works — cuts ~6k tokens/generation to a few hundred. Note this is
-    # different from "reasoning": None, which would omit the param and leave
-    # kimi's default thinking on.
-    {
-        "id": "openrouter/moonshotai/kimi-k2.5",
-        "short": "kimi25",
-        "reasoning": {"max_tokens": 4096},
-    },
-    {"id": "openrouter/x-ai/grok-4.3", "short": "grok43"},
-    {
-        "id": "openrouter/minimax/minimax-m3",
-        "short": "minimax",
-        "reasoning": {"max_tokens": 4096},
-    },
-    # Solver-tier models added as generator candidates (2026-06): tests whether
-    # solving-grade strength buys enough generation quality (correctness +
-    # mark_scheme) to justify the higher cost against the cheap tier on
-    # Cost/pass Q. grok-4.3 already appears above and in SOLVER_MODELS.
-    {"id": "openrouter/openai/gpt-5.5", "short": "gpt55"},
-    {"id": "gemini/gemini-3.5-flash", "short": "gemini-35-flash"},
 ]
 
-# Four solvers from different families: agreement between independent solvers
-# (vs the mark scheme) distinguishes "question is wrong" from "solver failed".
-# A solver may carry its own "reasoning" override (see SOLVER_REASONING); absent
-# that, the global default applies.
-SOLVER_MODELS = [
-    # Replaced claude-opus-4.8 (2026-06): ~40% of solver spend for a vote the
-    # judge was told to discount (over-reject profile), and the Anthropic
-    # perspective is already represented by the judge. grok-4.3 adds a family
-    # not present anywhere else in the pipeline at ~6x lower cost; probe run
-    # (_probe_grok.py) caught both known scheme_wrong cases without
-    # false-flagging the control.
-    {"id": "openrouter/x-ai/grok-4.3", "short": "grok43"},
-    {"id": "openrouter/openai/gpt-5.5", "short": "gpt55"},
-    {"id": "gemini/gemini-3.5-flash", "short": "gemini-35-flash"},
-    # Fourth family (2026-06): replaced minimax-m3, then opus-4.6, both of which
-    # hit the OpenRouter instant-connection-failure / blank finish_reason 'error'
-    # pattern under load (opus especially, being the heaviest model with the
-    # tightest capacity — and it duplicated JUDGE_MODEL, so its vote wasn't
-    # independent). qwen3.7-plus is a solving-grade reasoning model from a family
-    # (Alibaba) present nowhere else in the pipeline, reliable on OpenRouter, and
-    # far cheaper than opus.
-    # {"id": "openrouter/qwen/qwen3.7-plus", "short": "qwen-plus"},
-    # Temporarily disabled (2026-06): the deepseek-v4-pro endpoint on
-    # OpenRouter was returning instant connection failures and blank
-    # completions (finish_reason 'error'), exhausting retries on every call.
-    # Re-enable once the provider settles. When re-enabled, note it ignores
-    # "effort" (reasons regardless), so the global effort cap can't bound it —
-    # the hard reasoning max_tokens budget below is the only knob that keeps it
-    # from blowing the solve max_tokens on chain-of-thought.
-    # {
-    #     "id": "openrouter/deepseek/deepseek-v4-pro",
-    #     "short": "deepseek-pro",
-    #     "reasoning": {"max_tokens": 2048},
-    # },
-]
+# --- Fixed helper stages (shared across every candidate, not ranked) ---------
 
-# Known error profile per solver, fed to the judge so it does not weigh the
-# votes equally. Derived from agreement analysis of past runs; update when the
-# solver line-up or observed behaviour changes.
-SOLVER_PROFILES = {
-    "grok43": "newly added; error profile not yet characterised — treat its vote with mild caution",
-    "gpt55": "balanced error profile",
-    "gemini-35-flash": "credulous; known to over-confirm (may agree with a flawed mark scheme)",
-    "qwen-plus": "newly added; error profile not yet characterised — treat its vote with mild caution",
-    "deepseek-pro": "reasoning model, newly added; error profile not yet characterised — treat its vote with mild caution",
+# Maths optimiser: solves each draft, neatens the constants, builds the mark
+# scheme, and emits every computed value latex-ready. Runs direct on Google AI
+# Studio with the server-side code-execution sandbox (native_code_exec) — the
+# deterministic oracle for the whole chain. Needs GEMINI_API_KEY.
+OPTIMISER_MODEL = {
+    "id": "gemini/gemini-3.5-flash",
+    "short": "gemini-opt",
+    "native_code_exec": True,
 }
 
-# Repairs malformed JSON from any generator OR solver (syntax only, never
-# content). Cheap and shared across all models so it doesn't bias the comparison.
+# Typesetter: turns the optimiser's finalized maths + values into HTML for the
+# question and mark scheme. No sandbox — it only formats, using the optimiser's
+# exact values so it can't hallucinate numbers. OpenRouter.
+TYPESETTER_MODEL = {"id": "openrouter/openai/gpt-5.5", "short": "typeset"}
+
+# Maths judge: re-verifies each finalized question against its mark scheme using
+# Google's sandbox, returning a hard maths-correct verdict per question.
+MATHS_JUDGE_MODEL = {
+    "id": "gemini/gemini-3.5-flash",
+    "short": "gemini-judge",
+    "native_code_exec": True,
+}
+
+# Repairs malformed JSON from any stage (syntax only, never content). Cheap and
+# shared across all stages so it doesn't bias the comparison.
 CLEANER_MODEL = {
     "id": "openrouter/anthropic/claude-haiku-4-5",
     "short": "haiku-cleaner",
 }
 
-# Cross-provider backup for the Haiku cleaner/gate calls. The primary route
-# (Anthropic/Haiku via OpenRouter) intermittently drops connections instantly
-# (Timeout with time-taken 0s) or returns blank finish_reason 'error' responses
-# that exhaust all retries — a longer backoff doesn't help an instant-fail, so
-# the fix is to fall through to a capable cheap model on a *different* provider
-# rather than give up (cleaner) or fail open (gate). gpt-5.4-nano is OpenAI, a
-# different upstream than Anthropic, and competent at structured-JSON tasks.
+# Cross-provider backup for the Haiku cleaner. The primary route (Anthropic/Haiku
+# via OpenRouter) intermittently drops connections instantly (Timeout with
+# time-taken 0s) or returns blank finish_reason 'error' responses that exhaust
+# all retries — a longer backoff doesn't help an instant-fail, so the fix is to
+# fall through to a capable cheap model on a *different* provider rather than give
+# up. gpt-5.4-nano is OpenAI, a different upstream than Anthropic, and competent
+# at structured-JSON tasks.
 CLEANER_FALLBACK_MODEL = {
     "id": "openrouter/openai/gpt-5.4-nano",
     "short": "gpt-nano-cleaner",
 }
 
-JUDGE_MODEL = {"id": "openrouter/anthropic/claude-opus-4-6", "short": "opus46"}
+# Style/suitability judge: confirms command word, difficulty calibration and
+# exam-paper style. The maths is the maths judge's job, so this judge scores no
+# correctness dimension. Claude Opus.
+STYLE_JUDGE_MODEL = {"id": "openrouter/anthropic/claude-opus-4-6", "short": "opus46"}
 
-# Cheap equivalence check that gates the reconciliation pass: the full
-# (expensive) solver reconcile call only fires for answers the gate says don't
-# match the mark scheme. Shared across all solvers so it doesn't bias the
-# comparison; instructed to fail open (unsure -> mismatch -> reconcile anyway).
-GATE_MODEL = {"id": "openrouter/anthropic/claude-haiku-4-5", "short": "haiku-gate"}
-
-# Same cross-provider backup idea for the gate (see CLEANER_FALLBACK_MODEL): on a
-# primary-route outage the gate tries this before falling open, so a transient
-# Haiku blip doesn't push every answer into the expensive reconcile call.
-GATE_FALLBACK_MODEL = {
-    "id": "openrouter/openai/gpt-5.4-nano",
-    "short": "gpt-nano-gate",
-}
+# How many questions the drafter produces per (topic, board), carried through
+# every downstream stage. A knob, not a constant, so 1-vs-3 can be A/B'd for
+# quality (run.py --questions-per-topic overrides it). Nothing downstream
+# hardcodes a count — stages iterate over however many questions exist.
+QUESTIONS_PER_TOPIC = 3
 
 TOPICS = [
     "Differentiation",
@@ -160,13 +92,13 @@ TOPICS = [
 # to justify doubling the run cost.
 BOARDS = ["Edexcel"]
 
-# The generator is split into three strand specialists (Pure / Mechanics /
-# Statistics), each carrying its own design guards (see prompts.STRAND_GUARDS).
-# A topic is routed to one specialist on its ASSESSED OBJECTIVE, not the
-# technique it happens to use — Vectors is Pure tooling Mechanics borrows, an
-# E(X) integral is Statistics even though it integrates. Every TOPICS entry must
-# appear here; strand_for_topic raises on a gap so a new topic can't silently
-# fall through to the wrong specialist.
+# A topic is routed to one of three strands (Pure / Mechanics / Statistics) on
+# its ASSESSED OBJECTIVE, not the technique it happens to use — Vectors is Pure
+# tooling Mechanics borrows, an E(X) integral is Statistics even though it
+# integrates. The strand selects the design guards (see prompts.STRAND_GUARDS)
+# fed to the drafter (design intent) and optimiser (what to verify/preserve).
+# Every TOPICS entry must appear here; strand_for_topic raises on a gap so a new
+# topic can't silently fall through to the wrong strand.
 STRANDS = ("pure", "mechanics", "statistics")
 
 TOPIC_STRANDS = {
@@ -186,63 +118,32 @@ TOPIC_STRANDS = {
     "Moments": "mechanics",
 }
 
-# A generation passes when the judge total meets this. Shared by the judge
-# stage (scheme_wrong consensus hard-fail) and the report.
-PASS_THRESHOLD = 18
+# A question passes the panel only if the maths judge confirms it correct AND
+# its Opus suitability total (command_word + difficulty + style, 3-15) meets
+# this. The maths gate is hard pass/fail; this is the quality gate.
+SUITABILITY_THRESHOLD = 11
 
 
 # Request body addition that makes OpenRouter return the actual billed cost
 # in the response's usage object (usage.cost).
 USAGE_INCLUDE = {"usage": {"include": True}}
 
-# Solver chain-of-thought budget. "effort" is the portable knob OpenRouter
-# normalises across the Anthropic / OpenAI / Gemini families; solvers that ignore
-# it (e.g. deepseek-v4-pro) override with a hard token budget on their own dict.
-# Set to "high" for stronger verification — but note high effort means a long
-# reasoning trace, which previously truncated the JSON answer at the old 8192
-# max_tokens (gemini-3.5-flash burned ~8188 thinking tokens and emitted nothing
-# parseable). The solve/reconcile calls now run at 16384 max_tokens to give that
-# trace headroom; keep them in sync if you raise this further.
-SOLVER_REASONING = {"effort": "medium"}
+# Drafter chain-of-thought budget. The drafter only brainstorms scenarios (no
+# maths), so a low cap keeps the cost comparison fair across candidates. "effort"
+# is the portable knob OpenRouter normalises across families; per-model
+# "reasoning" overrides (or None to opt out) live on the MODELS entries.
+GENERATOR_REASONING = {"effort": "low"}
 
-# Same idea for the generators under test: cap chain-of-thought so reasoning
-# models (minimax-m3 was burning >20k thinking tokens per generation) don't
-# dominate the cost comparison. Applied uniformly so no candidate gets an
-# unfair thinking budget; per-model "reasoning" overrides (or None to opt
-# out) live on the MODELS entries.
-GENERATOR_REASONING = {"effort": "medium"}
+# The optimiser does the heavy maths in Google's sandbox — give it room to
+# reason about which constants make the numbers neat.
+OPTIMISER_REASONING = {"effort": "medium"}
 
-# The judge scores every question on five dimensions in one batched call, so it
-# runs at "high" — stronger reasoning here is worth the spend (judge cost is
-# shared eval overhead, excluded from the per-candidate Cost/pass Q) and the
-# scoring quality gates every downstream metric. Kept above medium deliberately,
-# unlike the generator/solver knobs.
+# The typesetter only formats given values into HTML; no reasoning needed.
+TYPESETTER_REASONING = None
+
+# Both judges run at high effort — scoring quality gates every downstream metric
+# and judge cost is shared eval overhead, excluded from per-candidate Cost/pass Q.
 JUDGE_REASONING = {"effort": "high"}
-
-# --- Code-in-loop generation (the run_python tool) -------------------------
-# Each specialist gets a Python tool during generation so it computes and
-# verifies every non-trivial value (binomial/normal/decimal/multi-step) and
-# asserts its design invariants against a deterministic oracle instead of
-# guessing arithmetic. This is NOT in-generator self-verification (an LLM
-# reasoning about its own correctness, which past runs found harmful) — a Python
-# interpreter is a deterministic oracle, the correct thing to put in the loop.
-
-# Command used to execute generator-emitted Python. Defaults to
-# `uv run --with sympy python -` so sympy/numpy are importable regardless of
-# which interpreter runs the harness (uv caches the resolved env after the first
-# call). Override with EVAL_SANDBOX_CMD (a shell-quoted command) to point at a
-# prepared interpreter, e.g. "python" when sympy is already installed.
-SANDBOX_CMD = shlex.split(
-    os.environ.get("EVAL_SANDBOX_CMD", "uv run --with sympy python -")
-)
-
-# Max generator<->python rounds per generation before tools are removed and a
-# final answer is forced. Bounds cost and stops a runaway tool loop.
-CODE_LOOP_MAX_ITERS = 8
-
-# Per-call wall-clock cap (s) and stdout/stderr cap (chars) for sandboxed code.
-SANDBOX_TIMEOUT = 30
-SANDBOX_OUTPUT_LIMIT = 4000
 
 
 # --- Routing: OpenRouter vs direct provider --------------------------------

@@ -5,25 +5,17 @@ from collections import defaultdict
 from tabulate import tabulate
 from jinja2 import Template
 
-from config import PASS_THRESHOLD
+from config import SUITABILITY_THRESHOLD
 
 
-def _solve_cost(solutions: list[dict]) -> float:
-    """Solving cost = blind solve + reconciliation pass (absent on old runs)."""
-    return sum(
-        s.get("solver_cost_usd", 0) + s.get("reconcile_cost_usd", 0) for s in solutions
-    )
+def _stage_cost(records: list[dict], *fields: str) -> float:
+    """Sum the named cost fields across a stage's records (missing -> 0)."""
+    return sum(sum(r.get(f, 0) for f in fields) for r in records)
 
 
-def _question_totals(judgement: dict) -> list[int]:
-    """Per-question /25 totals carried by a judgement, [] for a failed batch."""
-    return [q.get("total", 0) for q in judgement.get("questions") or []]
-
-
-def _label(row: dict) -> str:
-    """Grouping key for the report: the prompt variant in an A/B compare run,
-    else the model short name (normal model-ranking runs)."""
-    return row.get("prompt_variant") or row["model_short"]
+def _q_entries(judgement: dict) -> list[dict]:
+    """Per-question judge entries carried by a judgement, [] for a failed batch."""
+    return judgement.get("questions") or []
 
 
 def join_records(generations: list[dict], judgements: list[dict]) -> list[dict]:
@@ -36,38 +28,45 @@ def join_records(generations: list[dict], judgements: list[dict]) -> list[dict]:
     return rows
 
 
-def assemble_viewer_data(generations: list[dict], judgements: list[dict]) -> dict:
+def assemble_viewer_data(
+    generations: list[dict], typesettings: list[dict], judgements: list[dict]
+) -> dict:
+    """Per-model batches for the HTML viewer. Each question pairs the typesetter's
+    HTML with its panel verdict, keyed by the judge's question_index (the scoring
+    source of truth); HTML is pulled from the matching typeset entry by index."""
+    tmap = {t["generation_id"]: t for t in typesettings}
     jmap = {j["generation_id"]: j for j in judgements}
     by_model: dict[str, list] = defaultdict(list)
 
     for gen in generations:
-        jdg = jmap.get(gen["generation_id"], {})
-        parsed = gen.get("output_parsed") or {}
-        questions = parsed.get("questions", []) if isinstance(parsed, dict) else []
-        q_judgements = {q.get("question_index"): q for q in jdg.get("questions") or []}
+        gid = gen["generation_id"]
+        jdg = jmap.get(gid, {})
+        ts_questions = (tmap.get(gid, {}) or {}).get("questions", [])
 
-        # The viewer keys per-question judgements by positional index, so an
-        # unjudged question still shows (as 0/fail). compute_model_stats instead
-        # counts only judged entries — the two can diverge if the judge ever
-        # returns fewer entries than the generation parsed (it shouldn't).
         merged = []
-        for i, q in enumerate(questions):
-            qj = q_judgements.get(i, {})
-            total = qj.get("total", 0)
+        for qj in _q_entries(jdg):
+            i = qj.get("question_index", len(merged))
+            tq = ts_questions[i] if isinstance(i, int) and i < len(ts_questions) else {}
             merged.append({
-                **q,
-                "score": total,
-                "scores": qj.get("scores", {}),
-                "passed": total >= PASS_THRESHOLD,
+                "question_html": tq.get("question_html", ""),
+                "mark_scheme_html": tq.get("mark_scheme_html", ""),
+                "commandWord": tq.get("commandWord", ""),
+                "marks": tq.get("marks"),
+                "difficulty": tq.get("difficulty", ""),
+                "maths_correct": bool(qj.get("maths_correct")),
+                "suitability_total": qj.get("suitability_total", 0),
+                "passed": bool(qj.get("passed")),
                 "flags": qj.get("flags", []),
                 "notes": qj.get("notes", {}),
+                "maths_note": qj.get("maths_note", ""),
             })
 
-        totals = [m["score"] for m in merged]
-        by_model[_label(gen)].append({
+        totals = [m["suitability_total"] for m in merged]
+        by_model[gen["model_short"]].append({
             "topic": gen.get("topic", ""),
             "board": gen.get("board", ""),
-            "passed": sum(1 for t in totals if t >= PASS_THRESHOLD),
+            "passed": sum(1 for m in merged if m["passed"]),
+            "maths_ok": sum(1 for m in merged if m["maths_correct"]),
             "n_questions": len(merged),
             "avg_score": round(statistics.mean(totals), 1) if totals else 0,
             "batch_flags": jdg.get("flags", []),
@@ -80,43 +79,40 @@ def assemble_viewer_data(generations: list[dict], judgements: list[dict]) -> dic
 def compute_model_stats(rows: list[dict]) -> dict:
     by_model = defaultdict(list)
     for row in rows:
-        by_model[_label(row)].append(row)
+        by_model[row["model_short"]].append(row)
 
     stats = {}
     for short, model_rows in by_model.items():
-        q_totals = [t for r in model_rows for t in _question_totals(r["_judgement"])]
+        q_entries = [q for r in model_rows for q in _q_entries(r["_judgement"])]
         costs = [r["cost_usd"] for r in model_rows]
         latencies = sorted(r["latency_ms"] for r in model_rows)
         json_fails = sum(1 for r in model_rows if not r["json_parse_ok"])
-        raw_fails = sum(
-            1 for r in model_rows if not r.get("json_parse_ok_raw", r["json_parse_ok"])
-        )
+        raw_fails = sum(1 for r in model_rows if not r.get("json_parse_ok_raw", r["json_parse_ok"]))
 
-        n_questions = len(q_totals)
-        passed_questions = sum(1 for t in q_totals if t >= PASS_THRESHOLD)
-        avg_score = statistics.mean(q_totals) if q_totals else 0
+        n_questions = len(q_entries)
+        passed = sum(1 for q in q_entries if q.get("passed"))
+        maths_ok = sum(1 for q in q_entries if q.get("maths_correct"))
+        suit_totals = [q.get("suitability_total", 0) for q in q_entries]
+        avg_suit = statistics.mean(suit_totals) if suit_totals else 0
         avg_cost = statistics.mean(costs)
-        # Quality only: failed generations contribute no questions, so they do
-        # not enter this denominator. Their cost is penalised via cost_per_pass.
-        pass_rate = passed_questions / n_questions if n_questions else 0
-        score_per_dollar = avg_score / avg_cost if avg_cost > 0 else 0
+        # Quality only: failed drafts contribute no questions, so they don't
+        # enter these denominators. Their cost is penalised via cost_per_pass.
+        pass_rate = passed / n_questions if n_questions else 0
+        maths_rate = maths_ok / n_questions if n_questions else 0
         p50 = latencies[len(latencies) // 2]
 
-        # Generation cost only (solver/judge excluded as shared harness
-        # overhead), divided by individually-passing questions. The numerator is
-        # the FULL generation spend — every batch, including failed ones and the
-        # non-passing questions inside otherwise-passing batches — so this is the
-        # all-in price of producing a usable question, not a per-question
-        # cost allocation.
-        gen_cost_total = sum(costs)
-        cost_per_pass = gen_cost_total / passed_questions if passed_questions else None
+        # Drafter (generation) cost only — optimiser/typeset/judge are fixed
+        # shared overhead, not the candidate's production cost. Numerator is the
+        # FULL drafter spend (including failed batches), so this is the all-in
+        # price of a usable question.
+        cost_per_pass = sum(costs) / passed if passed else None
 
         stats[short] = {
-            "avg_score": round(avg_score, 1),
+            "avg_suit": round(avg_suit, 1),
             "pass_rate": pass_rate,
+            "maths_rate": maths_rate,
             "avg_cost_usd": avg_cost,
             "total_cost_usd": sum(costs),
-            "score_per_dollar": round(score_per_dollar, 0),
             "cost_per_pass_usd": cost_per_pass,
             "raw_json_fail_pct": round(100 * raw_fails / len(model_rows), 1),
             "json_fail_pct": round(100 * json_fails / len(model_rows), 1),
@@ -130,37 +126,37 @@ def _fmt_cost_per_pass(s: dict) -> str:
     return f"${v:.5f}" if v is not None else "—"
 
 
+_HEADERS = ["Model", "Avg /15", "Pass rate", "Maths OK", "Avg cost/gen", "Cost/pass Q",
+            "Total cost", "Raw JSON fail%", "JSON fail%", "p50 latency"]
+
+
 def format_markdown_table(stats: dict) -> str:
-    rows = sorted(stats.items(), key=lambda x: -x[1]["avg_score"])
+    rows = sorted(stats.items(), key=lambda x: -x[1]["avg_suit"])
     table = [
         [
             short,
-            f"{s['avg_score']}/25",
+            f"{s['avg_suit']}/15",
             f"{s['pass_rate']*100:.0f}%",
+            f"{s['maths_rate']*100:.0f}%",
             f"${s['avg_cost_usd']:.5f}",
             _fmt_cost_per_pass(s),
             f"${s['total_cost_usd']:.4f}",
-            f"{s['score_per_dollar']:.0f}",
             f"{s['raw_json_fail_pct']:.1f}%",
             f"{s['json_fail_pct']:.1f}%",
             f"{s['p50_latency_ms']}ms",
         ]
         for short, s in rows
     ]
-    headers = ["Model", "Avg /25", "Pass rate", "Avg cost/gen", "Cost/pass Q", "Total cost", "Score per $1", "Raw JSON fail%", "JSON fail%", "p50 latency"]
-    return tabulate(table, headers=headers, tablefmt="github")
+    return tabulate(table, headers=_HEADERS, tablefmt="github")
 
 
 def compute_topic_matrix(rows: list[dict]) -> dict:
-    """{topic: {label: avg per-question judge score}} — across boards, where
-    label is the prompt variant in an A/B run or the model short name otherwise.
-
-    A label with only failed generations in a topic contributes no questions and
-    is omitted from that topic's cell (renders as "—").
-    """
+    """{topic: {model: avg per-question suitability}} across boards. A model with
+    only failed batches in a topic contributes no questions and is omitted."""
     cells: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
     for r in rows:
-        cells[r.get("topic", "")][_label(r)].extend(_question_totals(r["_judgement"]))
+        suits = [q.get("suitability_total", 0) for q in _q_entries(r["_judgement"])]
+        cells[r.get("topic", "")][r["model_short"]].extend(suits)
     matrix = {
         topic: {m: round(statistics.mean(v), 1) for m, v in models.items() if v}
         for topic, models in cells.items()
@@ -186,9 +182,7 @@ def format_topic_table(topic_matrix: dict, model_order: list[str]) -> str:
 def _build_topic_matrix_html(topic_matrix: dict, model_order: list[str]) -> str:
     if not topic_matrix:
         return ""
-    header_cells = "<th>Topic</th>" + "".join(
-        f"<th>{_html.escape(m)}</th>" for m in model_order
-    )
+    header_cells = "<th>Topic</th>" + "".join(f"<th>{_html.escape(m)}</th>" for m in model_order)
     body_rows = ""
     for topic in _topics_hardest_first(topic_matrix):
         cells = ""
@@ -197,48 +191,34 @@ def _build_topic_matrix_html(topic_matrix: dict, model_order: list[str]) -> str:
             if v is None:
                 cells += "<td>—</td>"
             else:
-                color = "#f59e0b" if v >= PASS_THRESHOLD else "#dc2626"
+                color = "#f59e0b" if v >= SUITABILITY_THRESHOLD else "#dc2626"
                 cells += f'<td style="font-weight:600;color:{color}">{v}</td>'
-        body_rows += (
-            f'<tr><td style="font-weight:500;color:#1c1917">{_html.escape(topic)}</td>{cells}</tr>'
-        )
+        body_rows += f'<tr><td style="font-weight:500;color:#1c1917">{_html.escape(topic)}</td>{cells}</tr>'
     return (
-        f'<h3 class="cost-heading">Per-topic scores (avg /25, hardest first)</h3>'
-        f'<div class="table-scroll">'
-        f'<table class="stats-table">'
-        f'<thead><tr>{header_cells}</tr></thead>'
-        f'<tbody>{body_rows}</tbody>'
+        f'<h3 class="cost-heading">Per-topic suitability (avg /15, hardest first)</h3>'
+        f'<div class="table-scroll"><table class="stats-table">'
+        f'<thead><tr>{header_cells}</tr></thead><tbody>{body_rows}</tbody>'
         f'</table></div>'
     )
 
 
-def _build_summary_html(
-    stats: dict,
-    n_gens: int,
-    gen_cost: float,
-    solve_cost: float,
-    judge_cost: float,
-    topic_matrix: dict | None = None,
-) -> str:
-    rows_sorted = sorted(stats.items(), key=lambda x: -x[1]["avg_score"])
-    total_cost = gen_cost + solve_cost + judge_cost
+def _build_summary_html(stats, n_gens, costs: dict, topic_matrix=None) -> str:
+    rows_sorted = sorted(stats.items(), key=lambda x: -x[1]["avg_suit"])
+    total_cost = sum(costs.values())
 
-    headers = ["Model", "Avg /25", "Pass rate", "Avg cost/gen", "Cost/pass Q", "Total cost",
-               "Score per $1", "Raw JSON fail%", "JSON fail%", "p50 latency"]
-    header_cells = "".join(f"<th>{h}</th>" for h in headers)
-
+    header_cells = "".join(f"<th>{h}</th>" for h in _HEADERS)
     body_rows = ""
     for short, s in rows_sorted:
-        color = "#f59e0b" if s["avg_score"] >= PASS_THRESHOLD else "#dc2626"
+        color = "#f59e0b" if s["avg_suit"] >= SUITABILITY_THRESHOLD else "#dc2626"
         body_rows += (
             f'<tr>'
             f'<td style="font-weight:500;color:#1c1917">{_html.escape(short)}</td>'
-            f'<td style="font-weight:700;color:{color}">{s["avg_score"]}/25</td>'
+            f'<td style="font-weight:700;color:{color}">{s["avg_suit"]}/15</td>'
             f'<td>{s["pass_rate"]*100:.0f}%</td>'
+            f'<td>{s["maths_rate"]*100:.0f}%</td>'
             f'<td>${s["avg_cost_usd"]:.5f}</td>'
             f'<td>{_fmt_cost_per_pass(s)}</td>'
             f'<td>${s["total_cost_usd"]:.4f}</td>'
-            f'<td>{int(s["score_per_dollar"])}</td>'
             f'<td>{s["raw_json_fail_pct"]:.1f}%</td>'
             f'<td>{s["json_fail_pct"]:.1f}%</td>'
             f'<td>{s["p50_latency_ms"]}ms</td>'
@@ -252,17 +232,16 @@ def _build_summary_html(
         f'<div class="summary">'
         f'<p class="summary-meta">{n_gens} generations &nbsp;&middot;&nbsp;'
         f' Total cost: <strong>${total_cost:.2f}</strong></p>'
-        f'<div class="table-scroll">'
-        f'<table class="stats-table">'
-        f'<thead><tr>{header_cells}</tr></thead>'
-        f'<tbody>{body_rows}</tbody>'
+        f'<div class="table-scroll"><table class="stats-table">'
+        f'<thead><tr>{header_cells}</tr></thead><tbody>{body_rows}</tbody>'
         f'</table></div>'
         f'{topic_html}'
         f'<h3 class="cost-heading">Cost breakdown</h3>'
         f'<table class="cost-table"><tbody>'
-        f'<tr><td>Generation</td><td>${gen_cost:.4f}</td></tr>'
-        f'<tr><td>Solving</td><td>${solve_cost:.4f}</td></tr>'
-        f'<tr><td>Judging</td><td>${judge_cost:.4f}</td></tr>'
+        f'<tr><td>Generation</td><td>${costs["generation"]:.4f}</td></tr>'
+        f'<tr><td>Optimise</td><td>${costs["optimise"]:.4f}</td></tr>'
+        f'<tr><td>Typeset</td><td>${costs["typeset"]:.4f}</td></tr>'
+        f'<tr><td>Judging</td><td>${costs["judge"]:.4f}</td></tr>'
         f'</tbody></table>'
         f'</div>'
     )
@@ -290,6 +269,7 @@ COMBINED_TEMPLATE = """<!DOCTYPE html>
       --gray-100: #f3f4f6;
       --amber-500: #f59e0b;
       --red-600: #dc2626;
+      --green-700: #047857;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: 'DM Sans', sans-serif; background: var(--cream); color: var(--stone-900); min-height: 100vh; }
@@ -353,6 +333,9 @@ COMBINED_TEMPLATE = """<!DOCTYPE html>
     .q-score-badge { font-weight: 700; font-size: 0.8125rem; }
     .q-score-badge.pass { color: var(--amber-500); }
     .q-score-badge.fail { color: var(--red-600); }
+    .maths-badge { font-size: 0.6875rem; font-weight: 600; padding: 0.125rem 0.4rem; border-radius: 0.25rem; }
+    .maths-ok { background: #d1fae5; color: var(--green-700); }
+    .maths-bad { background: #fee2e2; color: #991b1b; }
     .batch-meta { font-size: 0.875rem; color: var(--gray-600); }
     .flag-badge {
       display: inline-block; font-size: 0.6875rem; font-weight: 500;
@@ -361,7 +344,6 @@ COMBINED_TEMPLATE = """<!DOCTYPE html>
     }
     .flag-unsolvable { background: #fee2e2; color: #991b1b; }
     .flag-ambiguous { background: #ede9fe; color: #5b21b6; }
-    .flag-scheme-wrong { background: #ffedd5; color: #9a3412; }
     .flag-past-paper { background: #fef3c7; color: #92400e; }
     .batch-note, .q-note {
       font-size: 0.8125rem; color: var(--gray-600);
@@ -384,20 +366,8 @@ COMBINED_TEMPLATE = """<!DOCTYPE html>
     .difficulty-extension { background: #ede9fe; color: #4c1d95; }
     .cmd-word { font-size: 0.6875rem; color: var(--forest-800); font-style: italic; }
     .question-text { font-size: 1rem; line-height: 1.6; color: var(--stone-900); margin-bottom: 0.875rem; }
-    .mark-scheme { border-left: 3px solid #e5e7eb; padding-left: 1rem; }
-    .ms-row {
-      display: flex; align-items: baseline; gap: 0.625rem;
-      margin-bottom: 0.375rem; font-size: 0.9rem; line-height: 1.5;
-    }
-    .tag-chip {
-      font-size: 0.6875rem; font-weight: 600; padding: 0.125rem 0.375rem;
-      border-radius: 0.25rem; color: white; flex-shrink: 0; font-family: monospace;
-    }
-    .tag-M1 { background: #1d4ed8; }
-    .tag-A1 { background: #047857; }
-    .tag-B1 { background: #6d28d9; }
-    .tag-default { background: #6b7280; }
-    .ms-text { color: var(--gray-600); }
+    .mark-scheme { border-left: 3px solid #e5e7eb; padding-left: 1rem; font-size: 0.9rem; line-height: 1.5; color: var(--gray-600); }
+    .mark-scheme ol, .mark-scheme ul { padding-left: 1.25rem; }
     .empty { text-align: center; padding: 4rem 2rem; color: var(--gray-600); font-style: italic; }
     .katex { font-size: 1em !important; }
   </style>
@@ -418,6 +388,7 @@ COMBINED_TEMPLATE = """<!DOCTYPE html>
 const DATA = {{ data_json }};
 const MODELS = {{ models_json }};
 const SUMMARY_HTML = {{ summary_html_json }};
+const SUIT_THRESHOLD = {{ suit_threshold }};
 
 let currentView = '__summary__';
 let sortAsc = true;
@@ -451,20 +422,14 @@ function toggleSort() {
   renderContent();
 }
 
-function tagClass(tag) {
-  return {M1: 'tag-M1', A1: 'tag-A1', B1: 'tag-B1'}[tag] || 'tag-default';
-}
-
 function diffClass(d) {
   return {foundation: 'difficulty-foundation', higher: 'difficulty-higher', extension: 'difficulty-extension'}[d] || '';
 }
 
 function flagHtml(flag) {
-  if (flag === 'unsolvable_question') return '<span class="flag-badge flag-unsolvable">unsolvable</span>';
   if (flag === 'ambiguous_question') return '<span class="flag-badge flag-ambiguous">ambiguous</span>';
-  if (flag === 'scheme_wrong_consensus') return '<span class="flag-badge flag-scheme-wrong">scheme wrong</span>';
   if (flag === 'past_paper_suspected') return '<span class="flag-badge flag-past-paper">past paper</span>';
-  return '<span class="flag-badge">' + flag + '</span>';
+  return '<span class="flag-badge flag-unsolvable">' + flag + '</span>';
 }
 
 function e(s) {
@@ -492,30 +457,31 @@ function renderContent() {
       ? 'pass' : (batch.passed === 0 ? 'fail' : '');
 
     const questionsHtml = (batch.questions || []).map(function(q, qi) {
-      const msRows = (q.markScheme || []).map(function(ms) {
-        return '<div class="ms-row"><span class="tag-chip ' + tagClass(ms.tag) + '">' +
-          e(ms.tag) + '</span><span class="ms-text">' + ms.text + '</span></div>';
-      }).join('');
-
-      const qScoreClass = q.score >= {{ pass_threshold }} ? 'pass' : 'fail';
+      const qPassClass = q.passed ? 'pass' : 'fail';
+      const mathsBadge = q.maths_correct
+        ? '<span class="maths-badge maths-ok">&#10003; maths</span>'
+        : '<span class="maths-badge maths-bad">&#10007; maths</span>';
       const qFlags = (q.flags || []).map(flagHtml).join(' ');
-      const qNote = (q.notes && q.notes.correctness)
-        ? '<p class="q-note">' + e(q.notes.correctness) + '</p>'
-        : '';
+      const styleNote = (q.notes && q.notes.style)
+        ? '<p class="q-note">' + e(q.notes.style) + '</p>' : '';
+      const mathsNote = (!q.maths_correct && q.maths_note)
+        ? '<p class="q-note">' + e(q.maths_note) + '</p>' : '';
 
       return (qi > 0 ? '<hr class="question-divider">' : '') +
         '<div class="question">' +
         '<div class="question-meta">' +
           '<span class="q-num">Q' + (qi + 1) + '</span>' +
-          '<span class="q-score-badge ' + qScoreClass + '">' + q.score + '/25</span>' +
-          '<span class="marks-badge">' + e(q.marks) + 'm</span>' +
+          '<span class="q-score-badge ' + qPassClass + '">' + (q.passed ? 'PASS' : 'FAIL') + '</span>' +
+          mathsBadge +
+          '<span class="marks-badge">' + e(q.suitability_total) + '/15 suit</span>' +
+          (q.marks != null ? '<span class="marks-badge">' + e(q.marks) + 'm</span>' : '') +
           '<span class="difficulty-chip ' + diffClass(q.difficulty) + '">' + e(q.difficulty || '') + '</span>' +
           '<span class="cmd-word">' + e(q.commandWord || '') + '</span>' +
           qFlags +
         '</div>' +
-        '<div class="question-text">' + q.text + '</div>' +
-        qNote +
-        '<div class="mark-scheme">' + msRows + '</div>' +
+        '<div class="question-text">' + (q.question_html || '<em>(no typeset output)</em>') + '</div>' +
+        mathsNote + styleNote +
+        '<div class="mark-scheme">' + (q.mark_scheme_html || '') + '</div>' +
         '</div>';
     }).join('');
 
@@ -523,7 +489,7 @@ function renderContent() {
       '<hr class="batch-divider">' +
       '<div class="batch-header">' +
         '<span class="batch-score ' + batchScoreClass + '">' + batch.passed + '/' + batch.n_questions + ' passed</span>' +
-        '<span class="batch-meta">' + e(batch.topic) + ' &middot; ' + e(batch.board) + '</span>' +
+        '<span class="batch-meta">' + e(batch.topic) + ' &middot; ' + e(batch.board) + ' &middot; ' + batch.maths_ok + ' maths ok</span>' +
         flagsHtml +
       '</div>' +
       questionsHtml +
@@ -548,33 +514,33 @@ function renderContent() {
 def build_combined_report(
     run_id: str,
     generations: list[dict],
+    optimisations: list[dict],
+    typesettings: list[dict],
     judgements: list[dict],
     stats: dict | None = None,
-    solutions: list[dict] | None = None,
 ) -> str:
-    if solutions is None:
-        solutions = []
     rows = join_records(generations, judgements)
     if stats is None:
         stats = compute_model_stats(rows)
     topic_matrix = compute_topic_matrix(rows)
 
-    data = assemble_viewer_data(generations, judgements)
+    data = assemble_viewer_data(generations, typesettings, judgements)
     models_sorted = sorted(
         data.keys(),
         key=lambda m: -statistics.mean(b["avg_score"] for b in data[m]) if data[m] else 0,
     )
 
-    gen_cost = sum(g["cost_usd"] for g in generations)
-    solve_cost = _solve_cost(solutions)
-    judge_cost = sum(j.get("judge_cost_usd", 0) for j in judgements)
-    summary_html = _build_summary_html(
-        stats, len(generations), gen_cost, solve_cost, judge_cost, topic_matrix
-    )
+    costs = {
+        "generation": _stage_cost(generations, "cost_usd"),
+        "optimise": _stage_cost(optimisations, "opt_cost_usd"),
+        "typeset": _stage_cost(typesettings, "ts_cost_usd"),
+        "judge": _stage_cost(judgements, "maths_judge_cost_usd", "style_judge_cost_usd"),
+    }
+    summary_html = _build_summary_html(stats, len(generations), costs, topic_matrix)
 
     return Template(COMBINED_TEMPLATE).render(
         run_id=_html.escape(run_id),
-        pass_threshold=PASS_THRESHOLD,
+        suit_threshold=SUITABILITY_THRESHOLD,
         data_json=json.dumps(data, ensure_ascii=False),
         models_json=json.dumps(models_sorted),
         summary_html_json=json.dumps(summary_html),
@@ -584,7 +550,8 @@ def build_combined_report(
 def generate_report(
     run_id: str,
     generations: list[dict],
-    solutions: list[dict],
+    optimisations: list[dict],
+    typesettings: list[dict],
     judgements: list[dict],
     md_path: str,
     html_path: str,
@@ -592,18 +559,25 @@ def generate_report(
     rows = join_records(generations, judgements)
     stats = compute_model_stats(rows)
     topic_matrix = compute_topic_matrix(rows)
-    model_order = [short for short, _ in sorted(stats.items(), key=lambda x: -x[1]["avg_score"])]
+    model_order = [short for short, _ in sorted(stats.items(), key=lambda x: -x[1]["avg_suit"])]
 
-    gen_cost = sum(g["cost_usd"] for g in generations)
-    solve_cost = _solve_cost(solutions)
-    judge_cost = sum(j.get("judge_cost_usd", 0) for j in judgements)
+    costs = {
+        "generation": _stage_cost(generations, "cost_usd"),
+        "optimise": _stage_cost(optimisations, "opt_cost_usd"),
+        "typeset": _stage_cost(typesettings, "ts_cost_usd"),
+        "judge": _stage_cost(judgements, "maths_judge_cost_usd", "style_judge_cost_usd"),
+    }
 
     with open(md_path, "w", encoding="utf-8") as f:
         f.write(f"# Eval Report — {run_id}\n\n")
         f.write(format_markdown_table(stats))
-        f.write("\n\n## Per-topic scores (avg /25 across boards, hardest first)\n\n")
+        f.write("\n\n## Per-topic suitability (avg /15 across boards, hardest first)\n\n")
         f.write(format_topic_table(topic_matrix, model_order))
-        f.write(f"\n\n**Total cost:** generation ${gen_cost:.4f} | solving ${solve_cost:.4f} | judging ${judge_cost:.4f}\n")
+        f.write(
+            f"\n\n**Total cost:** generation ${costs['generation']:.4f} | "
+            f"optimise ${costs['optimise']:.4f} | typeset ${costs['typeset']:.4f} | "
+            f"judging ${costs['judge']:.4f}\n"
+        )
 
     with open(html_path, "w", encoding="utf-8") as f:
-        f.write(build_combined_report(run_id, generations, judgements, stats=stats, solutions=solutions))
+        f.write(build_combined_report(run_id, generations, optimisations, typesettings, judgements, stats=stats))

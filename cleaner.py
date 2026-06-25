@@ -5,8 +5,8 @@ transient OpenRouter outage — instant connection-timeouts (Timeout with
 time-taken 0s) or blank finish_reason 'error' responses that exhaust every
 retry. When that happens, or the primary returns text that still won't parse,
 the repair falls through to CLEANER_FALLBACK_MODEL on a *different* provider
-rather than giving up. Used by the generation stage and both solver stages
-(blind solve + reconcile).
+rather than giving up. Shared by every stage (draft / optimise / typeset) via
+prompts.cleaner_prompt_for(shape).
 """
 from typing import Callable
 

@@ -1,191 +1,91 @@
-﻿# evals/tests/test_judge.py
-import pytest, json
-from unittest.mock import AsyncMock, MagicMock, patch
-from config import PASS_THRESHOLD, SOLVER_MODELS
-from judge import apply_scheme_wrong_consensus, judge_one, group_solutions_by_generation
-
-GENERATION = {
-    "generation_id": "gen-abc",
-    "board": "AQA",
-    "topic": "Integration",
-    "json_parse_ok": True,
-    "output_parsed": {
-        "questions": [{"text": "Find ∫x dx", "marks": 2, "commandWord": "Find",
-                       "difficulty": "foundation", "markScheme": [{"tag": "M1", "text": "x²/2"}, {"tag": "A1", "text": "+ C"}]}]
-    }
-}
-
-SOLUTIONS = [
-    {"generation_id": "gen-abc", "solver_model": "openrouter/qwen/qwq-32b",
-     "answers": [{"question_index": 0, "answer": "x²/2 + C", "key_steps": ["integrate"]}],
-     "skipped": False, "parse_ok": True},
-    {"generation_id": "gen-abc", "solver_model": "openrouter/deepseek/deepseek-r1",
-     "answers": [{"question_index": 0, "answer": "x²/2 + C", "key_steps": ["integrate"]}],
-     "skipped": False, "parse_ok": True},
-]
-
-JUDGE_RESPONSE = json.dumps({
-    "questions": [
-        {"question_index": 0,
-         "scores": {"correctness": 5, "mark_scheme": 5, "command_word": 4,
-                    "difficulty": 4, "style": 4},
-         "total": 22,
-         "flags": [],
-         "notes": {"correctness": "Both solvers confirm.",
-                   "command_word": "Find is correct for AQA."}},
-    ],
-    "solver_agreement": {"qwq_agrees": True, "r1_agrees": True},
-})
+import pytest
+from unittest.mock import patch
+from config import MATHS_JUDGE_MODEL, SUITABILITY_THRESHOLD
+from judge import judge_one
 
 
-def _mock_response(content):
-    r = MagicMock()
-    r.choices[0].message.content = content
-    r.usage.prompt_tokens = 400
-    r.usage.completion_tokens = 120
-    r.usage.cost = 0.001  # OpenRouter-reported cost (usage.include)
-    return r
-
-
-@pytest.mark.asyncio
-async def test_judge_one_success():
-    with patch("llm_utils.litellm.acompletion", new_callable=AsyncMock, return_value=_mock_response(JUDGE_RESPONSE)):
-        record = await judge_one(GENERATION, SOLUTIONS)
-
-    assert record["generation_id"] == "gen-abc"
-    assert len(record["questions"]) == 1
-    q = record["questions"][0]
-    assert q["question_index"] == 0
-    assert q["total"] == 22
-    assert q["scores"]["correctness"] == 5
-    assert record["solver_agreement"]["qwq_agrees"] is True
-    assert record["flags"] == []
-
-
-@pytest.mark.asyncio
-async def test_judge_one_skips_parse_failure():
-    bad_gen = {**GENERATION, "json_parse_ok": False, "output_parsed": None}
-    with patch("llm_utils.litellm.acompletion", new_callable=AsyncMock) as mock_api:
-        record = await judge_one(bad_gen, SOLUTIONS)
-        mock_api.assert_not_called()
-
-    assert record["questions"] == []
-    assert "json_parse_failure" in record["flags"]
-    assert set(record["solver_agreement"]) == {f"{s['short']}_agrees" for s in SOLVER_MODELS}
-
-
-@pytest.mark.asyncio
-async def test_judge_one_handles_malformed_judge_response():
-    with patch("llm_utils.litellm.acompletion", new_callable=AsyncMock, return_value=_mock_response("oops")):
-        record = await judge_one(GENERATION, SOLUTIONS)
-
-    assert "judge_parse_failure" in record["flags"]
-    assert record["questions"] == []
-
-
-def _sol_with_verdict(short, verdict, question_index=0):
+def _opt(n_questions=1, skipped=False, parse_ok=True):
     return {
-        "generation_id": "gen-abc", "solver_short": short,
-        "answers": [], "skipped": False, "parse_ok": True,
-        "reconciliation": [
-            {"question_index": question_index, "verdict": verdict, "reason": "..."}
-        ],
-    }
-
-
-def _judgement_with_questions(*totals):
-    """One question per total, each starting at correctness 4 (total given)."""
-    return {
+        "generation_id": "gen-abc",
+        "board": "Edexcel",
+        "skipped": skipped,
+        "parse_ok": parse_ok,
         "questions": [
-            {"question_index": i,
-             "scores": {"correctness": 4, "mark_scheme": 4, "command_word": 4,
-                        "difficulty": 4, "style": t - 16},
-             "total": t,
-             "flags": []}
-            for i, t in enumerate(totals)
+            {"text": f"Q{i}", "marks": 2, "markScheme": [], "values": {}}
+            for i in range(n_questions)
         ],
-        "flags": [],
     }
 
 
-def test_scheme_wrong_consensus_caps_the_flagged_question():
-    """Two solvers agreeing a question's scheme is wrong caps THAT question
-    below pass, even if the judge scored it high."""
-    judgement = _judgement_with_questions(22, 22)  # q0, q1 both high
-    sols = [_sol_with_verdict("opus48", "scheme_wrong", question_index=0),
-            _sol_with_verdict("gpt55", "scheme_wrong", question_index=0),
-            _sol_with_verdict("gemini-35-flash", "agree", question_index=0)]
-    out = apply_scheme_wrong_consensus(judgement, sols)
-    q0 = out["questions"][0]
-    q1 = out["questions"][1]
-    assert q0["total"] < PASS_THRESHOLD
-    assert q0["scores"]["correctness"] == 2
-    assert "scheme_wrong_consensus" in q0["flags"]
-    # the other question is untouched
-    assert q1["total"] == 22
-    assert "scheme_wrong_consensus" not in q1["flags"]
+def _result(by_index, parse_ok=True):
+    return {"by_index": by_index, "parse_ok": parse_ok,
+            "input_tokens": 10, "output_tokens": 20, "cost": 0.001}
 
 
-def test_scheme_wrong_consensus_leaves_already_low_correctness():
-    """If the judge already scored correctness at or below the cap, consensus
-    must not raise it — but the flag is still added and the total clamped."""
-    judgement = {
-        "questions": [
-            {"question_index": 0,
-             "scores": {"correctness": 1, "mark_scheme": 4, "command_word": 4,
-                        "difficulty": 4, "style": 4},
-             "total": 17,
-             "flags": []}
-        ],
-        "flags": [],
-    }
-    sols = [_sol_with_verdict("opus48", "scheme_wrong", question_index=0),
-            _sol_with_verdict("gpt55", "scheme_wrong", question_index=0)]
-    out = apply_scheme_wrong_consensus(judgement, sols)
-    q0 = out["questions"][0]
-    assert q0["scores"]["correctness"] == 1  # untouched, already below cap
-    assert q0["total"] < PASS_THRESHOLD
-    assert "scheme_wrong_consensus" in q0["flags"]
-
-
-def test_single_scheme_wrong_verdict_is_not_consensus():
-    judgement = _judgement_with_questions(20)
-    sols = [_sol_with_verdict("opus48", "scheme_wrong", question_index=0),
-            _sol_with_verdict("gpt55", "agree", question_index=0)]
-    out = apply_scheme_wrong_consensus(judgement, sols)
-    assert out["questions"][0]["total"] == 20
-    assert out["questions"][0]["flags"] == []
-
-
-def test_scheme_wrong_on_different_questions_is_not_consensus():
-    """Consensus means the SAME question — two solvers each flagging a
-    different question is not convergence."""
-    judgement = _judgement_with_questions(20, 20, 20)
-    sols = [_sol_with_verdict("opus48", "scheme_wrong", question_index=1),
-            _sol_with_verdict("gpt55", "scheme_wrong", question_index=2)]
-    out = apply_scheme_wrong_consensus(judgement, sols)
-    assert all(q["total"] == 20 for q in out["questions"])
-    assert all(q["flags"] == [] for q in out["questions"])
+def _patched(maths_by_index, style_by_index, maths_ok=True, style_ok=True):
+    async def fake_judge_call(model, prompt, *, sandbox):
+        if model is MATHS_JUDGE_MODEL:
+            return _result(maths_by_index, maths_ok)
+        return _result(style_by_index, style_ok)
+    return patch("judge._judge_call", side_effect=fake_judge_call)
 
 
 @pytest.mark.asyncio
-async def test_judge_one_applies_consensus_rule():
-    sols = SOLUTIONS + [_sol_with_verdict("opus48", "scheme_wrong", question_index=0),
-                        _sol_with_verdict("gpt55", "scheme_wrong", question_index=0)]
-    with patch("llm_utils.litellm.acompletion", new_callable=AsyncMock, return_value=_mock_response(JUDGE_RESPONSE)):
-        record = await judge_one(GENERATION, sols)
+async def test_judge_one_passes_only_when_both_gates_pass():
+    """The both-gates rule: q0 passes (maths ok + high suit), q1 fails (maths
+    wrong despite high suit), q2 fails (maths ok but low suit)."""
+    high = SUITABILITY_THRESHOLD + 2
+    low = SUITABILITY_THRESHOLD - 2
+    maths = {0: {"maths_correct": True}, 1: {"maths_correct": False}, 2: {"maths_correct": True}}
+    style = {
+        0: {"suitability_total": high, "scores": {}},
+        1: {"suitability_total": high, "scores": {}},
+        2: {"suitability_total": low, "scores": {}},
+    }
+    with _patched(maths, style):
+        rec = await judge_one(_opt(3))
 
-    q0 = record["questions"][0]
-    assert q0["total"] < PASS_THRESHOLD
-    assert "scheme_wrong_consensus" in q0["flags"]
+    passed = [q["passed"] for q in rec["questions"]]
+    assert passed == [True, False, False]
 
 
-def test_group_solutions_by_generation():
-    sols = [
-        {"generation_id": "a", "solver_model": "qwq"},
-        {"generation_id": "b", "solver_model": "qwq"},
-        {"generation_id": "a", "solver_model": "r1"},
-    ]
-    grouped = group_solutions_by_generation(sols)
-    assert len(grouped["a"]) == 2
-    assert len(grouped["b"]) == 1
+@pytest.mark.asyncio
+async def test_judge_one_derives_suitability_total_from_scores():
+    """A missing suitability_total falls back to the sum of the three scores."""
+    maths = {0: {"maths_correct": True}}
+    style = {0: {"scores": {"command_word": 5, "difficulty": 5, "style": 4}}}
+    with _patched(maths, style):
+        rec = await judge_one(_opt(1))
+    assert rec["questions"][0]["suitability_total"] == 14
+    assert rec["questions"][0]["passed"] is True  # 14 >= threshold 11
+
+
+@pytest.mark.asyncio
+async def test_judge_one_skips_optimiser_failure():
+    opt = _opt(skipped=True)
+    # no judge calls should fire
+    with patch("judge._judge_call") as call:
+        rec = await judge_one(opt)
+        call.assert_not_called()
+    assert rec["questions"] == []
+    assert "optimiser_failure" in rec["flags"]
+
+
+@pytest.mark.asyncio
+async def test_judge_one_maths_parse_failure_fails_the_gate():
+    """A maths judge that doesn't parse flags the batch and fails every maths
+    gate (conservative: an unverified question does not pass)."""
+    style = {0: {"suitability_total": 15, "scores": {}}}
+    with _patched({}, style, maths_ok=False):
+        rec = await judge_one(_opt(1))
+    assert "maths_judge_parse_failure" in rec["flags"]
+    assert rec["questions"][0]["maths_correct"] is False
+    assert rec["questions"][0]["passed"] is False
+
+
+@pytest.mark.asyncio
+async def test_judge_one_accumulates_panel_costs():
+    with _patched({0: {"maths_correct": True}}, {0: {"suitability_total": 12, "scores": {}}}):
+        rec = await judge_one(_opt(1))
+    assert rec["maths_judge_cost_usd"] == 0.001
+    assert rec["style_judge_cost_usd"] == 0.001
