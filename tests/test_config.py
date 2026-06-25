@@ -16,6 +16,12 @@ from config import (
 )
 
 
+# An explicit OpenRouter model for the cost-recovery tests, so they don't depend
+# on whichever candidate happens to sit at MODELS[0] (the drafter set is cheap
+# models on mixed routes).
+_OR_MODEL = {"id": "openrouter/openai/gpt-5.4-nano", "short": "x"}
+
+
 def _response(cost=None, prompt_tokens=100, completion_tokens=200):
     r = MagicMock()
     r.usage = MagicMock(spec=["cost", "prompt_tokens", "completion_tokens"])
@@ -39,25 +45,25 @@ def test_strand_for_topic_raises_on_unmapped_topic():
 
 def test_response_cost_uses_openrouter_reported_cost():
     r = _response(cost=8.684e-05)
-    assert response_cost(MODELS[0], r) == 8.684e-05
+    assert response_cost(_OR_MODEL, r) == 8.684e-05
 
 
 def test_response_cost_accepts_zero_cost():
     # Free-tier models legitimately report 0
     r = _response(cost=0.0)
-    assert response_cost(MODELS[0], r) == 0.0
+    assert response_cost(_OR_MODEL, r) == 0.0
 
 
 def test_response_cost_returns_zero_and_warns_when_missing(capsys):
     r = _response(cost=None)
-    assert response_cost(MODELS[0], r) == 0.0
+    assert response_cost(_OR_MODEL, r) == 0.0
     assert "no OpenRouter cost" in capsys.readouterr().out
 
 
 def test_response_cost_returns_zero_on_non_numeric_cost(capsys):
     # Unexpected provider payloads must not leak into cost_usd
     r = _response(cost="0.001")
-    assert response_cost(MODELS[0], r) == 0.0
+    assert response_cost(_OR_MODEL, r) == 0.0
     assert "no OpenRouter cost" in capsys.readouterr().out
 
 
@@ -66,7 +72,7 @@ def test_response_cost_returns_zero_when_usage_lacks_cost_attr(capsys):
     r.usage = MagicMock(spec=["prompt_tokens", "completion_tokens"])
     r.usage.prompt_tokens = 100
     r.usage.completion_tokens = 200
-    assert response_cost(MODELS[0], r) == 0.0
+    assert response_cost(_OR_MODEL, r) == 0.0
     assert "no OpenRouter cost" in capsys.readouterr().out
 
 
@@ -128,10 +134,11 @@ def test_response_cost_direct_route_returns_zero_when_pricing_unknown(capsys):
     assert "completion_cost" in capsys.readouterr().out
 
 
-def test_generators_all_route_through_openrouter():
-    """The ranked candidates must all be OpenRouter so they compare fairly."""
+def test_generators_run_no_code():
+    """Drafters only brainstorm scenarios — the optimiser owns the maths, so no
+    candidate carries the native sandbox flag."""
     for m in MODELS:
-        assert route_of(m) == "openrouter"
+        assert not m.get("native_code_exec")
 
 
 def test_optimiser_and_maths_judge_use_native_gemini_sandbox():

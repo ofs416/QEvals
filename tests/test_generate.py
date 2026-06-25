@@ -23,7 +23,10 @@ VALID_DRAFTS = json.dumps({"drafts": ["Find dy/dx when y = x^2", "Show that x^2 
 
 @pytest.mark.asyncio
 async def test_generate_one_success():
-    model = MODELS[0]
+    # explicit OpenRouter model so the mocked usage.cost path is exercised
+    # (MODELS[0] may be a direct-Gemini candidate whose cost comes from the
+    # price table instead).
+    model = {"id": "openrouter/openai/gpt-5.4-nano", "short": "gpt-nano"}
     with patch("llm_utils.litellm.acompletion", new_callable=AsyncMock, return_value=_mock_response(VALID_DRAFTS)):
         record = await generate_one(model, "Integration", "Edexcel", "test-run", 2)
 

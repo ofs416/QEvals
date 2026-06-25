@@ -7,13 +7,14 @@ RESULTS_DIR = os.path.join(os.path.dirname(__file__), "results")
 # The ranked generator candidates — the DRAFTER stage. Each drafts question
 # scenarios only (no mark scheme, rough numbers); the maths optimiser owns the
 # arithmetic, so a generator no longer runs code and carries no native_code_exec.
-# All go through OpenRouter so their performance can be compared head-to-head.
-# A model may carry its own "reasoning" override; absent that, GENERATOR_REASONING
-# applies ("reasoning": None opts a model out of the param entirely).
+# Drafting is the cheap, creative half of the chain, so the candidates are
+# cheap models (Gemini Flash Lite + Chinese flash tiers). A model may carry its
+# own "reasoning" override; absent that, GENERATOR_REASONING applies
+# ("reasoning": None opts a model out of the param entirely).
 MODELS = [
-    {"id": "openrouter/openai/gpt-5.5", "short": "gpt55"},
-    {"id": "openrouter/x-ai/grok-4.3", "short": "grok43"},
-    {"id": "openrouter/qwen/qwen3.7-plus", "short": "qwen-plus"},
+    {"id": "gemini/gemini-3.1-flash-lite", "short": "gemini-lite"},
+    {"id": "openrouter/qwen/qwen3.6-flash", "short": "qwen-flash"},
+    {"id": "openrouter/deepseek/deepseek-v4-flash", "short": "deepseek"},
 ]
 
 # --- Fixed helper stages (shared across every candidate, not ranked) ---------
@@ -29,9 +30,9 @@ OPTIMISER_MODEL = {
 }
 
 # Typesetter: turns the optimiser's finalized maths + values into HTML for the
-# question and mark scheme. No sandbox — it only formats, using the optimiser's
-# exact values so it can't hallucinate numbers. OpenRouter.
-TYPESETTER_MODEL = {"id": "openrouter/openai/gpt-5.5", "short": "typeset"}
+# question and mark scheme. No sandbox — it only formats, reusing the optimiser's
+# exact values so it can't hallucinate numbers. A cheap formatter is plenty.
+TYPESETTER_MODEL = {"id": "openrouter/z-ai/glm-4.7-flash", "short": "typeset"}
 
 # Maths judge: re-verifies each finalized question against its mark scheme using
 # Google's sandbox, returning a hard maths-correct verdict per question.

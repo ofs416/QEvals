@@ -91,8 +91,8 @@ All model-level metrics are computed over **individual questions**, not whole ba
 
 litellm dispatches each call on its model-id prefix, and `config.route_of` mirrors that into the two things that differ per route:
 
-- **`openrouter/<provider>/<model>`** — routed through OpenRouter (needs `OPENROUTER_API_KEY`). Used by the drafter candidates, the typesetter, the style judge, and the cleaner. Requests carry `USAGE_INCLUDE` (so OpenRouter returns the billed cost in `usage.cost`), an optional `provider` routing block, and the portable `reasoning` knob — all in `extra_body`. `response_cost` reads `usage.cost`.
-- **`gemini/<model>`** — direct to Google AI Studio (needs `GEMINI_API_KEY`). Used by the optimiser and maths judge, which need the **server-side code-execution sandbox** (`native_code_exec: True` → `tools=[{"code_execution": {}}]`). No `extra_body`: chain-of-thought is capped via the top-level `reasoning_effort` param litellm maps to Gemini's `thinkingConfig`, and `response_cost` computes cost from `litellm.completion_cost` since direct providers don't report a billed cost.
+- **`openrouter/<provider>/<model>`** — routed through OpenRouter (needs `OPENROUTER_API_KEY`). Used by most drafter candidates, the typesetter, the style judge, and the cleaner. Requests carry `USAGE_INCLUDE` (so OpenRouter returns the billed cost in `usage.cost`), an optional `provider` routing block, and the portable `reasoning` knob — all in `extra_body`. `response_cost` reads `usage.cost`.
+- **`gemini/<model>`** — direct to Google AI Studio (needs `GEMINI_API_KEY`). Used by the optimiser and maths judge, which need the **server-side code-execution sandbox** (`native_code_exec: True` → `tools=[{"code_execution": {}}]`), and by any direct-Gemini drafter candidate (e.g. Gemini Flash Lite). No `extra_body`: chain-of-thought is capped via the top-level `reasoning_effort` param litellm maps to Gemini's `thinkingConfig`, and `response_cost` computes cost from `litellm.completion_cost` since direct providers don't report a billed cost.
 
 `config.request_kwargs(model, reasoning)` builds the per-route request kwargs and is the single place every stage constructs them. Add a model on a route by its id prefix, or force one with an explicit `"route"` key on the model dict.
 
@@ -102,9 +102,9 @@ litellm dispatches each call on its model-id prefix, and `config.route_of` mirro
 
 Defined in `config.py`. IDs are either OpenRouter paths (`openrouter/<provider>/<model>`) or direct-Gemini paths (`gemini/<model>`); see **Routing** above.
 
-- **Generator candidates** (`MODELS`) — the OpenRouter drafters being ranked
+- **Generator candidates** (`MODELS`) — the drafters being ranked. Drafting is the cheap, creative half of the chain, so these are cheap models (Gemini Flash Lite + Chinese flash tiers, e.g. `qwen3.6-flash`, `deepseek-v4-flash`) on whichever route their id prefix selects
 - **Optimiser** (`OPTIMISER_MODEL`) — Gemini with native sandbox; the deterministic maths oracle (fixed, shared)
-- **Typesetter** (`TYPESETTER_MODEL`) — OpenRouter; HTML rendering, no sandbox (fixed, shared)
+- **Typesetter** (`TYPESETTER_MODEL`) — a cheap formatter (`glm-4.7-flash`) on OpenRouter; HTML rendering, no sandbox (fixed, shared)
 - **Maths judge** (`MATHS_JUDGE_MODEL`) — Gemini with native sandbox; hard maths-correct gate
 - **Style judge** (`STYLE_JUDGE_MODEL`) — Claude Opus; suitability gate
 - **Cleaner** (`CLEANER_MODEL`) — Claude Haiku; syntax-only JSON repair shared across stages, with a cross-provider backup (`CLEANER_FALLBACK_MODEL`, gpt-5.4-nano) for primary-route outages
